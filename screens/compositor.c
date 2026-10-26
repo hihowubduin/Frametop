@@ -147,9 +147,14 @@ struct server {
     uint32_t relay_sent;  // when the relay last heard from us (ms)
     unsigned ticks;
     // Our keyboard ("vrkeyboard" commands from the input relay; see keyboard_command).
-    int kb_screen;         // the screen it's open for, -1 closed
-    bool kb_auto;          // opened for a focused text field (not by a button)
-    unsigned kb_close_at;  // ticks: close it then (a text field lost focus), 0 not
+    int kb_screen;          // the screen it's open for, -1 closed
+    bool kb_auto;           // opened for a focused text field (not by a button)
+    bool kb_reopen_on_click; // a focused text field allows reopening it after Close
+    bool kb_auto_dismissed;  // explicitly closed while that field stayed focused
+    bool kb_hidden_noted;    // avoid logging once a second while screens stay hidden
+    unsigned kb_close_at;    // ticks: close it then (a text field lost focus), 0 not
+    unsigned kb_reopen_at;   // delay reopening after a click, to let KWin report focus changes
+    int kb_reopen_screen;    // screen clicked for that pending reopen
     bool vr;               // connected to SteamVR (not --no-vr)
     bool beside;           // a second instance next to the desktop (--beside): remote screens only
 };
@@ -335,6 +340,7 @@ static void new_decoration(struct wl_listener *l, void *data) {
 // ---------------------------------------------------------------- input from the panels
 
 static void panel_key(struct server *s, uint32_t code, bool pressed);
+static void keyboard_button(struct server *s, int index);
 
 // Typing goes to remote screen `index` (or to the desktop: -1). The one it leaves lets go of
 // the keys it held.
@@ -353,10 +359,16 @@ static void handle_vr_event(const struct ft_event *e, void *data) {
         panel_key(s, e->key, e->pressed);
         return;
     }
-    if (e->type == FT_KEYBOARD_CLOSED) {
-        if (s->kb_screen >= 0) wlr_log(WLR_INFO, "keyboard closed");
+    if (e->type == FT_KEYBOARD_CLOSED || e->type == FT_KEYBOARD_HIDDEN) {
+        if (s->kb_screen >= 0) wlr_log(WLR_INFO, "keyboard %s", e->type == FT_KEYBOARD_CLOSED ? "closed" : "hidden");
+        if (e->type == FT_KEYBOARD_CLOSED) s->kb_auto_dismissed = true;
         s->kb_screen = -1;
         s->kb_close_at = 0;
+        s->kb_reopen_at = 0;
+        return;
+    }
+    if (e->type == FT_KEYBOARD_TOGGLE) {
+        keyboard_button(s, e->screen);
         return;
     }
     if (ft_remote_is(e->screen)) {
@@ -416,6 +428,11 @@ static void handle_vr_event(const struct ft_event *e, void *data) {
                     wlr_seat_keyboard_notify_enter(s->seat, surface, NULL, 0, NULL);
                     s->keys_clicked = true;
                     set_key_remote(s, -1);
+                    if (e->button == BTN_LEFT && s->kb_screen < 0 && s->kb_auto_dismissed &&
+                        s->kb_reopen_on_click) {
+                        s->kb_reopen_at = s->ticks + 9;
+                        s->kb_reopen_screen = e->screen;
+                    }
                 }
             }
             break;
@@ -543,6 +560,21 @@ static int tick(int fd, uint32_t mask, void *data) {
         if (s->kb_screen >= 0) {
             ft_vr_keyboard_hide();
             s->kb_screen = -1;
+            s->kb_auto = false;
+            s->kb_auto_dismissed = false;
+        }
+    }
+    if (s->kb_reopen_at && s->ticks >= s->kb_reopen_at) {
+        const int screen = s->kb_reopen_screen;
+        s->kb_reopen_at = 0;
+        if (screen >= 0 && screen < MAX_SCREENS && s->kb_screen < 0 && s->screens[screen] &&
+            s->kb_auto_dismissed && s->kb_reopen_on_click && ft_vr_screens_shown() &&
+            ft_vr_keyboard_show(screen)) {
+            s->kb_screen = screen;
+            s->kb_auto = true;
+            s->kb_auto_dismissed = false;
+            s->kb_close_at = 0;
+            wlr_log(WLR_INFO, "keyboard reopened on screen %d click", screen + 1);
         }
     }
     struct timespec now;
@@ -652,8 +684,9 @@ static void handle_key(struct server *s, uint32_t code, int value, char *reply, 
 // Our keyboard (keyboard.cpp). The input relay sends "vrkeyboard show" when a text field
 // on the desktop gets focus (and its setting allows), "vrkeyboard hide" when it loses it,
 // and "vrkeyboard toggle" for a mapped button; ft-layout sends "vrkeyboard close" when it
-// resets the layout. It opens for the screen KWin has keyboard focus on. A hide closes only a keyboard a text field opened, and waits a moment, so
-// moving between text fields doesn't close and reopen it.
+// resets the layout. It opens for the screen KWin has keyboard focus on. A hide closes only a
+// keyboard a text field opened, and waits a moment, so moving between text fields doesn't close
+// and reopen it. After Close, clicking a screen reopens it if the field is still focused.
 static int focused_screen(struct server *s) {
     struct wlr_surface *focus = s->seat->keyboard_state.focused_surface;
     for (int i = 0; i < MAX_SCREENS; ++i)
@@ -666,6 +699,17 @@ static int focused_screen(struct server *s) {
 
 static void keyboard_command(struct server *s, const char *what, char *reply, int size) {
     const bool open = s->kb_screen >= 0;
+    int focus;
+    if (sscanf(what, "focus %d", &focus) == 1 && (focus == 0 || focus == 1)) {
+        const bool reopen = focus != 0;
+        if (reopen && !s->kb_reopen_on_click) s->kb_auto_dismissed = false;
+        if (!reopen) {
+            s->kb_auto_dismissed = false;
+            s->kb_reopen_at = 0;
+        }
+        s->kb_reopen_on_click = reopen;
+        return (void)snprintf(reply, size, "ok");
+    }
     if (strcmp(what, "hide") == 0) {
         if (open && s->kb_auto && !s->kb_close_at) s->kb_close_at = s->ticks + 30;  // ~1/3 s
         return (void)snprintf(reply, size, "ok");
@@ -674,22 +718,34 @@ static void keyboard_command(struct server *s, const char *what, char *reply, in
         if (open) wlr_log(WLR_INFO, "keyboard closed (reset)");
         ft_vr_keyboard_hide();
         s->kb_screen = -1;
+        s->kb_auto = false;
+        s->kb_auto_dismissed = true;
         s->kb_close_at = 0;
+        s->kb_reopen_at = 0;
         return (void)snprintf(reply, size, "ok");
     }
     const bool toggle = strcmp(what, "toggle") == 0;
     if (!toggle && strcmp(what, "show") != 0) return (void)snprintf(reply, size, "error show|hide|toggle|close");
     s->kb_close_at = 0;
+    s->kb_reopen_at = 0;
     if (open && toggle) {
         ft_vr_keyboard_hide();
         s->kb_screen = -1;
+        s->kb_auto = false;
+        s->kb_auto_dismissed = true;
+        s->kb_reopen_at = 0;
         return (void)snprintf(reply, size, "ok closed");
     }
     if (open) return (void)snprintf(reply, size, "ok open");
+    if (s->kb_auto_dismissed && s->kb_reopen_on_click && !toggle)
+        return (void)snprintf(reply, size, "ok dismissed");
     if (!ft_vr_screens_shown()) {
-        wlr_log(WLR_INFO, "keyboard not opened (%s): the screens are hidden", toggle ? "button" : "text field");
+        if (!s->kb_hidden_noted)
+            wlr_log(WLR_INFO, "keyboard not opened (%s): the screens are hidden", toggle ? "button" : "text field");
+        s->kb_hidden_noted = true;
         return (void)snprintf(reply, size, "ok screens hidden");
     }
+    s->kb_hidden_noted = false;
     const int screen = focused_screen(s);
     if (screen < 0 || !ft_vr_keyboard_show(screen)) {
         wlr_log(WLR_INFO, "keyboard not opened (%s) for screen %d", toggle ? "button" : "text field", screen + 1);
@@ -698,7 +754,38 @@ static void keyboard_command(struct server *s, const char *what, char *reply, in
     wlr_log(WLR_INFO, "keyboard open for screen %d (%s)", screen + 1, toggle ? "button" : "text field");
     s->kb_screen = screen;
     s->kb_auto = !toggle;
+    s->kb_auto_dismissed = false;
     snprintf(reply, size, "ok opened");
+}
+
+static void keyboard_button(struct server *s, int index) {
+    if (index < 0 || index >= MAX_SCREENS) return;
+    s->kb_close_at = 0;
+    s->kb_reopen_at = 0;
+    if (s->kb_screen == index && !s->kb_auto && ft_vr_keyboard_is_under_screen(index)) {
+        ft_vr_keyboard_hide();
+        s->kb_screen = -1;
+        s->kb_auto = false;
+        s->kb_auto_dismissed = true;
+        wlr_log(WLR_INFO, "keyboard closed from screen %d", index + 1);
+    } else {
+        if (!ft_vr_keyboard_show_under_screen(index)) {
+            wlr_log(WLR_INFO, "keyboard not placed under screen %d", index + 1);
+            return;
+        }
+        s->kb_screen = index;
+        s->kb_auto = false;
+        s->kb_auto_dismissed = false;
+        wlr_log(WLR_INFO, "keyboard placed under screen %d", index + 1);
+    }
+    if (ft_remote_is(index)) {
+        set_key_remote(s, index);
+    } else {
+        set_key_remote(s, -1);
+        if (s->screens[index])
+            wlr_seat_keyboard_notify_enter(s->seat, s->screens[index]->toplevel->base->surface, NULL, 0, NULL);
+    }
+    s->keys_clicked = true;
 }
 
 // A key from our keyboard, for the focused screen. Its release always goes through, so
@@ -716,8 +803,8 @@ static void panel_key(struct server *s, uint32_t code, bool pressed) {
 // "toplevels" (-> "ok <count>" and a line per KWin window: "<screen> <w>x<h> <commits>
 // <title>"), "input <screen> move|down|up|leave [x y [left|right|middle]]" (pointer input
 // as if from that panel, x and y in its pixels; for tests, mostly with --no-vr),
-// "key <code> <value>", "vrkeyboard show|hide|toggle|close" (our keyboard, from the input
-// relay), and "click <overlay key>" (from the pointer helper: a mouse click landed on
+// "key <code> <value>", "vrkeyboard show|hide|toggle|close|focus 0|1" (our keyboard,
+// from the input relay), and "click <overlay key>" (from the pointer helper: a mouse click landed on
 // that panel, "-" for none); the rest is in vr.cpp (ft_vr_command).
 static int control_readable(int fd, uint32_t mask, void *data) {
     struct server *s = data;

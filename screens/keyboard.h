@@ -16,10 +16,12 @@ struct Event {
 };
 
 // Show the panel at `pose` (standing universe; its front faces +z), creating it the first
-// time. False if SteamVR won't make the overlay.
-bool Show(const vr::HmdMatrix34_t &pose);
+// time. `scale` multiplies its default size. False if SteamVR won't show the overlay.
+bool Show(const vr::HmdMatrix34_t &pose, double scale = 1.0);
 void Hide();
 bool Shown();
+// The keyboard's height in metres at the given size multiplier.
+double HeightMetres(double scale = 1.0);
 // Where it is now (it can be carried by its grab bar).
 const vr::HmdMatrix34_t &Pose();
 // A button came up on `device` somewhere else: stop carrying the panel if it was.

@@ -18,7 +18,18 @@ struct ft_dmabuf {
 };
 
 // FT_FRONT: a spin (the lazy susan) brought panel `screen` to straight ahead: typing goes there.
-enum ft_event_type { FT_MOTION, FT_BUTTON, FT_SCROLL, FT_LEAVE, FT_QUIT, FT_KEY, FT_KEYBOARD_CLOSED, FT_FRONT };
+enum ft_event_type {
+    FT_MOTION,
+    FT_BUTTON,
+    FT_SCROLL,
+    FT_LEAVE,
+    FT_QUIT,
+    FT_KEY,
+    FT_KEYBOARD_CLOSED,
+    FT_KEYBOARD_HIDDEN,
+    FT_KEYBOARD_TOGGLE,  // the screen control: show, reset, or hide it at `screen`
+    FT_FRONT
+};
 
 struct ft_event {
     enum ft_event_type type;
@@ -72,10 +83,13 @@ void ft_vr_forget(const void *key);
 // Poll panel input and SteamVR events.
 void ft_vr_poll(void (*handle)(const struct ft_event *, void *), void *data);
 // Our keyboard (keyboard.cpp), for typing on screen `index`: its keys arrive as FT_KEY
-// events, and FT_KEYBOARD_CLOSED when its Close key is pressed or the screens hide. False if
-// it can't be shown or there's no head pose. With the Steam menu or Steam's own keyboard
-// up, it waits and appears when they're gone.
+// events, FT_KEYBOARD_CLOSED on its Close key, and FT_KEYBOARD_HIDDEN when the screens hide.
+// False if it can't be shown or there's no head pose. With the Steam menu or Steam's own
+// keyboard up, it waits and appears when they're gone.
 bool ft_vr_keyboard_show(int index);
+// Show the keyboard beneath screen `index`, or check whether it is still there.
+bool ft_vr_keyboard_show_under_screen(int index);
+bool ft_vr_keyboard_is_under_screen(int index);
 void ft_vr_keyboard_hide(void);
 // A command from the control socket (@ft_screens); writes the reply (see vr.cpp).
 void ft_vr_command(const char *command, char *reply, int reply_size);

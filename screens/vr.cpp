@@ -13,6 +13,8 @@
 //     follows the screen's resolution).
 //   - a reset button left of the bar: the profile in use opened again, or every screen back
 //     in its layout, around where you are now (`ft-layout reset`, like Meta+Shift+R).
+//   - a keyboard button left of reset on each local desktop screen: show the keyboard at twice
+//     its default size below that screen, put it back there if moved, or hide it when it's there.
 //   The controls are translucent, like SteamVR's own, and brighten under a laser. They
 //   are invisible until a laser (a controller's, or the 3D mouse's) lands on or passes very close to
 //   one of them (UpdateControls).
@@ -259,7 +261,8 @@ struct Screen {
                           handle = vr::k_ulOverlayHandleInvalid, curveButton = vr::k_ulOverlayHandleInvalid,
                           rollButton = vr::k_ulOverlayHandleInvalid, dockButton = vr::k_ulOverlayHandleInvalid,
                           closeButton = vr::k_ulOverlayHandleInvalid,  // the last two: floating windows
-                          resetButton = vr::k_ulOverlayHandleInvalid;  // desktop screens only
+                          resetButton = vr::k_ulOverlayHandleInvalid,  // desktop and remote screens
+                          keyboardButton = vr::k_ulOverlayHandleInvalid;  // local desktop screens only
     int width = 0, height = 0;    // current buffer size (mouse scale)
     double metres = 1;
     double curve = 0;             // cylinder radius in metres; 0 = flat
@@ -276,7 +279,7 @@ struct Screen {
     double grabX = 0, grabY = 0;              // resize: the grab point relative to the corner
     Mat rollFrom = Identity();                // roll: the pose at the press (pinRel when pinned)
     double rollAngle = 0;                     // roll: the laser's angle around the centre then
-    bool hover[7] = {};                       // a laser is on the bar, curve, roll, resize, dock, close, reset control
+    bool hover[8] = {};                       // a laser is on a control
     bool lasers = true;                       // MakeOverlaysInteractiveIfVisible is set
     float controls = 0;                       // the controls' fade, 0 (hidden) .. 1
     bool controlsUp = false;                  // the controls' overlays are shown
@@ -321,11 +324,11 @@ struct Screen {
     // Buffer pixels from OpenVR's mouse position on the panel (its origin is bottom left).
     // A cropped panel too: SteamVR gives the position in the whole texture, not the crop.
     void ToBuffer(double mx, double my, double *x, double *y) const { *x = mx, *y = height - my; }
-    std::array<vr::VROverlayHandle_t, 7> Controls() const {
-        return {bar, curveButton, rollButton, handle, dockButton, closeButton, resetButton};
+    std::array<vr::VROverlayHandle_t, 8> Controls() const {
+        return {bar, curveButton, rollButton, handle, dockButton, closeButton, resetButton, keyboardButton};
     }
-    std::array<vr::VROverlayHandle_t, 8> All() const {
-        return {overlay, bar, curveButton, rollButton, handle, dockButton, closeButton, resetButton};
+    std::array<vr::VROverlayHandle_t, 9> All() const {
+        return {overlay, bar, curveButton, rollButton, handle, dockButton, closeButton, resetButton, keyboardButton};
     }
 };
 std::map<int, Screen> g_screens;
@@ -500,6 +503,22 @@ std::vector<uint8_t> ResetTexture(int n) {
         DiscRim);
 }
 
+std::vector<uint8_t> KeyboardTexture(int n) {
+    return ControlTexture(
+        n, InDisc,
+        [](double u, double v) {
+            if (std::fabs(u) > 0.62 || std::fabs(v) > 0.4) return false;
+            if (std::fabs(u) > 0.53 || std::fabs(v) > 0.31) return true;
+            for (int row = 0; row < 3; ++row)
+                for (int col = 0; col < 5; ++col)
+                    if (std::fabs(u - (-0.35 + col * 0.175)) < 0.055 &&
+                        std::fabs(v - (0.18 - row * 0.14)) < 0.035)
+                        return true;
+            return std::fabs(v + 0.23) < 0.035 && std::fabs(u) < 0.2;
+        },
+        DiscRim);
+}
+
 vr::VROverlayHandle_t MakeChrome(const char *key, const char *name, const std::vector<uint8_t> &px, int w, int h) {
     vr::VROverlayHandle_t o = vr::k_ulOverlayHandleInvalid;
     if (const auto err = vr::VROverlay()->CreateOverlay(key, name, &o); err != vr::VROverlayError_None) {
@@ -627,6 +646,20 @@ bool ScreenPose(const Screen &s, Mat *out) {
     return true;
 }
 
+constexpr double kKeyboardControlGap = 0.02;
+constexpr double kKeyboardUnderScreenScale = 2.0;
+
+bool KeyboardPoseBelowScreen(const Screen &s, double keyboardScale, Mat *out) {
+    Mat panel;
+    if (!ScreenPose(s, &panel)) return false;
+    // Clear the lowest edge of the screen's grab bar and adjacent controls.
+    const double controlDepth = s.chrome * (0.06 + 12.0 / 256) + std::max(s.chrome * 12.0 / 256, s.grip / 2);
+    const double below = s.heightMetres() / 2 + controlDepth + kKeyboardControlGap +
+                         keyboard::HeightMetres(keyboardScale) / 2;
+    *out = Mul(panel, Translation(0, -below, 0.015));
+    return true;
+}
+
 // The controls' size from both the screen's width and its distance from the head (the
 // geometric mean of 12% of the width and 10% of the distance), so a small screen near you
 // gets small controls and a big or far one gets big ones, never under about 1.7 degrees.
@@ -658,12 +691,11 @@ Mat OnSurface(const Screen &s, double u, double v, double dz) {
 double BarY(const Screen &s) { return -(s.heightMetres() / 2 + s.chrome * 0.06 + s.chrome * 12 / 256); }
 Mat BarOffset(const Screen &s) { return OnSurface(s, 0, BarY(s), 0.003); }
 
-// Put the bar, the curve button, and the corner tab under the screen (same parent: the
-// room or the controller), sized for the screen and its distance, and on its surface.
-// Where each control sits, relative to the screen: bar, curve, roll, resize tab, a
-// floating window's dock and close buttons (left of the bar), and a desktop screen's reset
-// button (left of the bar, where a floating window has its dock button).
-std::array<Mat, 7> ControlOffsets(const Screen &s) {
+// Put the bar, its controls, and the corner tab under the screen (same parent: the room
+// or the controller), sized for the screen and its distance, and on its surface.
+// Offsets are bar, curve, roll, resize, dock, close, reset, keyboard. A desktop screen's
+// keyboard button sits to the left of reset; floating windows use those slots for dock/close.
+std::array<Mat, 8> ControlOffsets(const Screen &s) {
     const double h = s.heightMetres(), bar = s.chrome, button = s.grip, gap = bar * 0.06;
     return {BarOffset(s), OnSurface(s, bar / 2 + gap + button / 2, BarY(s), 0.003),
             OnSurface(s, bar / 2 + gap * 2 + button * 1.5, BarY(s), 0.003),
@@ -671,7 +703,8 @@ std::array<Mat, 7> ControlOffsets(const Screen &s) {
             OnSurface(s, s.metres / 2 + s.grip / 2, -(h / 2 + s.grip / 2), 0.003),
             OnSurface(s, -(bar / 2 + gap + button / 2), BarY(s), 0.003),
             OnSurface(s, -(bar / 2 + gap * 2 + button * 1.5), BarY(s), 0.003),
-            OnSurface(s, -(bar / 2 + gap + button / 2), BarY(s), 0.003)};
+            OnSurface(s, -(bar / 2 + gap + button / 2), BarY(s), 0.003),
+            OnSurface(s, -(bar / 2 + gap * 2 + button * 1.5), BarY(s), 0.003)};
 }
 
 // A floating window's popups and dialogs, a few millimetres in front of it, where they are
@@ -708,13 +741,15 @@ void PlaceChrome(Screen &s) {
         vr::VROverlay()->SetOverlayWidthInMeters(s.closeButton, float(button));
     } else {
         vr::VROverlay()->SetOverlayWidthInMeters(s.resetButton, float(button));
+        if (s.keyboardButton != vr::k_ulOverlayHandleInvalid)
+            vr::VROverlay()->SetOverlayWidthInMeters(s.keyboardButton, float(button));
     }
     // Curved, the bar bends with the screen's bottom edge.
     vr::VROverlay()->SetOverlayCurvature(s.bar, s.curve > 0 ? float(std::min(1.0, bar / (2 * M_PI * s.curve))) : 0.f);
     const std::pair<vr::VROverlayHandle_t, Mat> parts[] = {
         {s.bar, offsets[0]},        {s.curveButton, offsets[1]}, {s.rollButton, offsets[2]},
         {s.handle, offsets[3]},     {s.dockButton, offsets[4]},  {s.closeButton, offsets[5]},
-        {s.resetButton, offsets[6]}};
+        {s.resetButton, offsets[6]}, {s.keyboardButton, offsets[7]}};
     PlaceSubs(s);
     if (s.pinned != kNone) {
         for (const auto &[o, off] : parts) {
@@ -836,10 +871,10 @@ bool ModeVisible() {
 void ApplyAlpha(const Screen &s) {
     vr::VROverlay()->SetOverlayAlpha(s.overlay, s.alpha);
     for (const auto &[k, sub] : s.subs) vr::VROverlay()->SetOverlayAlpha(sub.overlay, s.alpha);
-    const bool active[7] = {s.hover[0] || s.drag == Drag::Move, s.hover[1], s.hover[2] || s.drag == Drag::Roll,
-                            s.hover[3] || s.drag == Drag::Resize, s.hover[4], s.hover[5], s.hover[6]};
+    const bool active[8] = {s.hover[0] || s.drag == Drag::Move, s.hover[1], s.hover[2] || s.drag == Drag::Roll,
+                            s.hover[3] || s.drag == Drag::Resize, s.hover[4], s.hover[5], s.hover[6], s.hover[7]};
     const auto controls = s.Controls();
-    for (int k = 0; k < 7; ++k)
+    for (int k = 0; k < 8; ++k)
         if (controls[k] != vr::k_ulOverlayHandleInvalid)
             vr::VROverlay()->SetOverlayAlpha(controls[k], s.alpha * s.controls * (active[k] ? 1.f : kChromeIdle));
 }
@@ -995,7 +1030,7 @@ void UpdateControls() {
             for (double f : {-0.5, -0.25, 0.0, 0.25, 0.5})
                 spots.push_back(Mul(p, Mul(offsets[0], Translation(f * s.chrome, 0, 0))));
             const auto controls = s.Controls();
-            for (int k = 1; k < 7; ++k)
+            for (int k = 1; k < 8; ++k)
                 if (controls[k] != vr::k_ulOverlayHandleInvalid) spots.push_back(Mul(p, offsets[k]));
             const double reach = std::max(s.grip * 1.5, s.chrome * 0.12);
             for (const Mat &d : lasers) {
@@ -1406,7 +1441,7 @@ void DropFloatPanel(Screen &s) {
     for (auto o : s.All())
         if (o != vr::k_ulOverlayHandleInvalid) vr::VROverlay()->DestroyOverlay(o);
     s.overlay = s.bar = s.handle = s.curveButton = s.rollButton = s.dockButton = s.closeButton = s.resetButton =
-        vr::k_ulOverlayHandleInvalid;
+        s.keyboardButton = vr::k_ulOverlayHandleInvalid;
     s.visible = s.controlsUp = s.barLit = false;
     s.controls = 0;
     std::fill(std::begin(s.hover), std::end(s.hover), false);
@@ -2000,6 +2035,7 @@ void UpdateCutouts() {
 // overlay again now and then, so it's looked up each time.
 bool g_steamInFront = false;
 bool g_keyboardAside = false;   // ours is waiting for Steam to get out of the way
+double g_keyboardScale = 1.0;
 Mat g_asidePose = Identity();   // ...and goes here then
 
 bool SteamInFront() {
@@ -2012,17 +2048,19 @@ bool SteamInFront() {
 
 void UpdateSteamInFront() {
     const bool front = SteamInFront();
-    if (front == g_steamInFront) return;
-    g_steamInFront = front;
-    std::printf("Steam %s%s\n", front ? "in front (the Steam menu or Steam's keyboard)" : "out of the way",
-                front && keyboard::Shown() ? ": our keyboard steps aside" : !front && g_keyboardAside ? ": our keyboard comes back" : "");
-    if (front && keyboard::Shown()) {
-        g_asidePose = keyboard::Pose();
-        keyboard::Hide();
-        g_keyboardAside = true;
-    } else if (!front && g_keyboardAside) {
+    if (front != g_steamInFront) {
+        g_steamInFront = front;
+        std::printf("Steam %s%s\n", front ? "in front (the Steam menu or Steam's keyboard)" : "out of the way",
+                    front && keyboard::Shown() ? ": our keyboard steps aside" : !front && g_keyboardAside ? ": our keyboard comes back" : "");
+        if (front && keyboard::Shown()) {
+            g_asidePose = keyboard::Pose();
+            keyboard::Hide();
+            g_keyboardAside = true;
+        }
+    }
+    if (!front && g_keyboardAside && keyboard::Show(g_asidePose, g_keyboardScale)) {
         g_keyboardAside = false;
-        if (keyboard::Show(g_asidePose)) AnnounceOverlay("frametop.keyboard");
+        AnnounceOverlay("frametop.keyboard");
     }
 }
 
@@ -2166,6 +2204,10 @@ bool MakePanel(Screen &s, const char *prefix, const char *label) {
     } else {
         static const auto reset = ResetTexture(64);
         s.resetButton = chrome("reset", "reset the layout", reset, 64, 64);
+        if (!s.remote) {
+            static const auto keyboardIcon = KeyboardTexture(64);
+            s.keyboardButton = chrome("keyboard", "show or hide the keyboard", keyboardIcon, 64, 64);
+        }
     }
     ApplyAlpha(s);
     return true;
@@ -2194,7 +2236,7 @@ void ft_vr_screen_create(int index, double metres, int count) {
 }
 
 // A remote screen's panel (remote.c): like a screen's, with its own overlay keys. False if
-// SteamVR made no panel (it allows k_unMaxOverlayCount overlays in all, and each panel with
+// SteamVR made no panel (it allows k_unMaxOverlayCount overlays in all, and this panel with
 // its controls takes six).
 // A remote screen's place while its stream is stopped (Remote Displays' Disconnect): its next
 // start puts it back there. Only for this run: the room's coordinates may not be the same in
@@ -2476,6 +2518,20 @@ void ft_vr_poll(void (*handle)(const struct ft_event *, void *), void *data) {
                 ReleaseAwayBy(ev.trackedDeviceIndex, ev.data.mouse.button, handle, data);
             }
         }
+        // Show or hide the keyboard below this screen, snapping it back if it was moved.
+        while (s.keyboardButton != vr::k_ulOverlayHandleInvalid &&
+               vr::VROverlay()->PollNextOverlayEvent(s.keyboardButton, &ev, sizeof ev)) {
+            hover(7);
+            if (ev.eventType == vr::VREvent_MouseButtonDown && ev.data.mouse.button == vr::VRMouseButton_Left) {
+                ft_event e{};
+                e.type = FT_KEYBOARD_TOGGLE;
+                e.screen = index;
+                handle(&e, data);
+            } else if (ev.eventType == vr::VREvent_MouseButtonUp) {
+                EndDragsBy(ev.trackedDeviceIndex);
+                ReleaseAwayBy(ev.trackedDeviceIndex, ev.data.mouse.button, handle, data);
+            }
+        }
         // The roll button: drag around like a knob, or scroll.
         while (vr::VROverlay()->PollNextOverlayEvent(s.rollButton, &ev, sizeof ev)) {
             hover(2);
@@ -2533,7 +2589,7 @@ void ft_vr_poll(void (*handle)(const struct ft_event *, void *), void *data) {
         g_keyboardAside = false;
         keyboard::Hide();
         ft_event e{};
-        e.type = FT_KEYBOARD_CLOSED;
+        e.type = FT_KEYBOARD_HIDDEN;
         e.screen = -1;
         handle(&e, data);
     }
@@ -2568,6 +2624,7 @@ constexpr double kKeyboardAhead = 0.7, kKeyboardBelow = 0.35;
 
 bool ft_vr_keyboard_show(int index) {
     if (g_screens.find(index) == g_screens.end()) return false;
+    g_keyboardScale = 1.0;
     RefreshPoses();
     Mat head;
     if (!DevicePose(vr::k_unTrackedDeviceIndex_Hmd, &head)) {
@@ -2585,7 +2642,48 @@ bool ft_vr_keyboard_show(int index) {
         std::printf("keyboard: waiting for Steam to close\n");
         return true;
     }
-    if (!keyboard::Show(FacingPose(at, head))) return false;
+    if (!keyboard::Show(FacingPose(at, head), g_keyboardScale)) return false;
+    AnnounceOverlay("frametop.keyboard");
+    return true;
+}
+
+bool ft_vr_keyboard_is_under_screen(int index) {
+    const auto it = g_screens.find(index);
+    if (it == g_screens.end() || (!keyboard::Shown() && !g_keyboardAside)) return false;
+    RefreshPoses();
+    Mat target;
+    if (!KeyboardPoseBelowScreen(it->second, g_keyboardScale, &target)) return false;
+    const Mat &pose = g_keyboardAside ? g_asidePose : keyboard::Pose();
+    const double dx = pose.m[0][3] - target.m[0][3], dy = pose.m[1][3] - target.m[1][3],
+                 dz = pose.m[2][3] - target.m[2][3];
+    if (dx * dx + dy * dy + dz * dz > 0.06 * 0.06) return false;
+    for (int c = 0; c < 3; ++c) {
+        const double dot = pose.m[0][c] * target.m[0][c] + pose.m[1][c] * target.m[1][c] +
+                           pose.m[2][c] * target.m[2][c];
+        if (dot < 0.98) return false;
+    }
+    return true;
+}
+
+bool ft_vr_keyboard_show_under_screen(int index) {
+    const auto it = g_screens.find(index);
+    if (it == g_screens.end()) return false;
+    RefreshPoses();
+    Mat pose;
+    if (!KeyboardPoseBelowScreen(it->second, kKeyboardUnderScreenScale, &pose)) return false;
+    keyboard::SetLasers(LasersByMode());
+    g_steamInFront = SteamInFront();
+    if (g_steamInFront) {
+        if (keyboard::Shown()) keyboard::Hide();
+        g_keyboardScale = kKeyboardUnderScreenScale;
+        g_asidePose = pose;
+        g_keyboardAside = true;
+        std::printf("keyboard: waiting for Steam to close\n");
+        return true;
+    }
+    if (!keyboard::Show(pose, kKeyboardUnderScreenScale)) return false;
+    g_keyboardScale = kKeyboardUnderScreenScale;
+    g_keyboardAside = false;
     AnnounceOverlay("frametop.keyboard");
     return true;
 }

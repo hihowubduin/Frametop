@@ -926,16 +926,25 @@ def main():
         except OSError:
             pass  # ft-screens not running
 
-    def text_field(focused):
-        """A text field on the desktop gained or lost keyboard focus (the input method)."""
-        mode = vr_keyboard_mode()
+    def text_field(focused, sync=False):
+        """A text field gained/lost focus, or the input method refreshed its focus state."""
+        changed = state.get("text_field_focused") is not focused
+        state["text_field_focused"] = focused
         if not focused:
-            if not state["rules"].get("vr_keyboard_persist", True):
+            if not sync or state.get("text_field_auto") is not False:
+                vr_keyboard("focus 0")
+                state["text_field_auto"] = False
+            if (changed or not sync) and not state["rules"].get("vr_keyboard_persist", True):
                 vr_keyboard("hide")  # ft-screens closes it only if it opened it for a text field
             return
+        mode = vr_keyboard_mode()
         keyboards = sorted({n.name for n in nodes.values()
                             if n.candidate and n.is_keyboard and n.role == "passthrough" and not n.uinput})
-        if mode == "always" or (mode == "no_keyboard" and not keyboards):
+        auto = mode == "always" or (mode == "no_keyboard" and not keyboards)
+        if state.get("text_field_auto") is not auto or (auto and not sync):
+            vr_keyboard(f"focus {int(auto)}")
+            state["text_field_auto"] = auto
+        if auto:
             vr_keyboard("show")
             why = "asking ft-screens to open Frametop's keyboard"
         elif mode == "no_keyboard":
@@ -1285,6 +1294,9 @@ def main():
                     continue
                 if cmd == "textfield" and len(words) == 2:
                     text_field(words[1] == "1")
+                    continue
+                if cmd == "textfield" and len(words) == 3 and words[1] == "sync":
+                    text_field(words[2] == "1", sync=True)
                     continue
                 if cmd == "gazeawake" and len(words) == 2:
                     if state["pointer"]:

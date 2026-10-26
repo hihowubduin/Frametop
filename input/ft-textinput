@@ -7,16 +7,19 @@ whenever the focused app enables text input on a field (text-input v1/v2/v3: Qt,
 and Firefox apps do; Xwayland apps and most Electron apps don't). This only passes that
 on: "textfield 1" or "textfield 0" to the input relay (@frametop_relay), which opens or
 closes Frametop's keyboard (ft-screens' own key panel), depending on the keyboard setting
-in Frametop Input Settings. Typing on it reaches the app as key presses from ft-screens,
-not through this input method, so nothing typed passes through here.
+in Frametop Input Settings. It sends "textfield sync 0|1" once a second so a relay restart
+doesn't lose an already-focused field. Typing on the keyboard reaches the app as
+key presses from ft-screens, not through this input method.
 
 Speaks the Wayland wire protocol itself (zwp_input_method_v1 only), so it needs nothing
 but Python on the SteamOS host.
 """
 import os
+import select
 import socket
 import struct
 import sys
+import time
 
 RELAY = "\0frametop_relay"
 DISPLAY, REGISTRY, INPUT_METHOD = 1, 2, 3  # our object ids
@@ -44,20 +47,29 @@ def main():
     def request(obj, opcode, payload=b""):
         conn.sendall(struct.pack("=II", obj, (8 + len(payload)) << 16 | opcode) + payload)
 
-    def report(on):
+    def report(on, sync=False):
+        kind = "sync " if sync else ""
         try:
-            relay.sendto(f"textfield {int(on)}".encode(), RELAY)
+            relay.sendto(f"textfield {kind}{int(on)}".encode(), RELAY)
         except OSError:
             pass  # the relay isn't running
 
     request(DISPLAY, 1, struct.pack("=I", REGISTRY))  # wl_display.get_registry
     contexts = set()  # KWin makes one per activation
     buf = b""
+    last_report = time.monotonic()
     while True:
+        timeout = max(0.0, 1.0 - (time.monotonic() - last_report))
+        readable, _, _ = select.select([conn], [], [], timeout)
+        if not readable:
+            report(bool(contexts), sync=True)
+            last_report = time.monotonic()
+            continue
         data = conn.recv(65536)
         if not data:
             return  # KWin went away
         buf += data
+        state_changed = False
         while len(buf) >= 8:
             obj, word = struct.unpack_from("=II", buf)
             size, opcode = word >> 16, word & 0xFFFF
@@ -75,14 +87,17 @@ def main():
                     request(REGISTRY, 0, struct.pack("=I", name) + string(interface) + struct.pack("=II", 1, INPUT_METHOD))
             elif obj == INPUT_METHOD and opcode == 0:  # activate: a text field has focus
                 contexts.add(struct.unpack_from("=I", body)[0])
-                report(True)
+                state_changed = True
             elif obj == INPUT_METHOD and opcode == 1:  # deactivate: it lost focus
                 (context,) = struct.unpack_from("=I", body)
                 if context in contexts:
                     contexts.discard(context)
                     request(context, 0)  # zwp_input_method_context_v1.destroy
-                report(bool(contexts))
+                    state_changed = True
             # Everything else (the contexts' surrounding text, content type, ...) is unused.
+        if state_changed:
+            report(bool(contexts))
+            last_report = time.monotonic()
 
 
 if __name__ == "__main__":

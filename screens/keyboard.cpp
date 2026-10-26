@@ -428,8 +428,9 @@ bool Create() {
 
 }  // namespace
 
-bool Show(const vr::HmdMatrix34_t &pose) {
-    if (!Create()) return false;
+bool Show(const vr::HmdMatrix34_t &pose, double scale) {
+    if (!(scale > 0) || !std::isfinite(scale) || !Create()) return false;
+    vr::VROverlay()->SetOverlayWidthInMeters(g_overlay, float(kWidthMetres * scale));
     Place(pose);
     if (!g_shown) {
         std::fill(std::begin(g_latched), std::end(g_latched), false);
@@ -437,9 +438,17 @@ bool Show(const vr::HmdMatrix34_t &pose) {
         g_hoverGrip = false;
         g_dragDevice = vr::k_unTrackedDeviceIndexInvalid;
         Draw();
-        vr::VROverlay()->ShowOverlay(g_overlay);
-        g_shown = true;
     }
+    if (!vr::VROverlay()->IsOverlayVisible(g_overlay)) {
+        const auto error = vr::VROverlay()->ShowOverlay(g_overlay);
+        if (error != vr::VROverlayError_None) {
+            g_shown = false;
+            std::fprintf(stderr, "keyboard: can't show overlay: %s\n",
+                         vr::VROverlay()->GetOverlayErrorNameFromEnum(error));
+            return false;
+        }
+    }
+    g_shown = true;
     return true;
 }
 
@@ -451,12 +460,15 @@ void EndDragBy(uint32_t device) {
 
 void Hide() {
     StopCarrying();
-    if (!g_shown) return;
+    if (g_overlay == vr::k_ulOverlayHandleInvalid) return;
+    if (!g_shown && !vr::VROverlay()->IsOverlayVisible(g_overlay)) return;
     vr::VROverlay()->HideOverlay(g_overlay);
     g_shown = false;
 }
 
 bool Shown() { return g_shown; }
+
+double HeightMetres(double scale) { return kWidthMetres * scale * kH / kW; }
 
 void SetLasers(bool on) {
     static vr::VROverlayHandle_t set = vr::k_ulOverlayHandleInvalid;  // the overlay `was` is for

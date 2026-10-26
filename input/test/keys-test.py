@@ -420,9 +420,10 @@ def tests():
 
     # A text field on the desktop got focus (ft-textinput): Frametop's keyboard by the Keyboard
     # setting, and a log line saying why, once per decision (scripts/report.sh reads them).
-    def text_field():
+    def text_field(focused=True, sync=False):
         c = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        c.sendto(b"textfield 1", f"\0{tag}_relay")
+        message = f"textfield {'sync ' if sync else ''}{int(focused)}"
+        c.sendto(message.encode(), f"\0{tag}_relay")
         time.sleep(0.1)
         return [m for m in typed() if m.startswith("vrkeyboard")]
 
@@ -432,15 +433,21 @@ def tests():
         return got
 
     typed(), said()
-    check("text field, a keyboard connected (default setting): no keyboard", text_field(), [])
+    check("text field, a keyboard connected (default setting): no keyboard", text_field(), ["vrkeyboard focus 0"])
     check("...and the log says why", said(), [("text field focused: not opening Frametop's keyboard: a keyboard is "
                                                "connected (test keyboard), and the Keyboard setting opens it only "
                                                "without one")])
-    check("the same again: not logged twice", (text_field(), said()), ([], []))
+    check("the same again: not logged twice", (text_field(sync=True), said()), ([], []))
+    text_field(False)
     vr_keyboard["mode"] = "always"
     use(None)
-    check("text field, setting always: it opens", text_field(), ["vrkeyboard show"])
+    check("text field, setting always: it opens", text_field(), ["vrkeyboard focus 1", "vrkeyboard show"])
     check("...logged", said(), ["text field focused: asking ft-screens to open Frametop's keyboard"])
+    check("a new text-field activation resets dismissal", text_field(), ["vrkeyboard focus 1", "vrkeyboard show"])
+    check("active text field heartbeat retries the open command", text_field(sync=True), ["vrkeyboard show"])
+    check("heartbeat doesn't repeat the decision log", said(), [])
+    check("text field deactivation clears auto-reopen", text_field(False), ["vrkeyboard focus 0"])
+    check("inactive text field heartbeat doesn't repeat the decision", text_field(False, sync=True), [])
     vr_keyboard["mode"] = "never"
     use(None)
     check("text field, setting never: no keyboard, logged",
